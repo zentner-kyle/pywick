@@ -28,8 +28,19 @@ class Var:
         evaluator.notify(self)
 
     def unify(self, other):
-        Ex([self], identity, other)
-        Ex([other], identity, self)
+        def unify(self_or_other):
+            if (isinstance(self.value, Group) and
+                    isinstance(other.value, Group)):
+                self.value.unify(other.value)
+            return self
+        Ex([self], unify, other)
+        Ex([other], unify, self)
+
+    def __repr__(self):
+        if self.ctxt is None:
+            return 'Var({!r})'.format(self.value)
+        else:
+            return 'Var({!r}, {!r})'.format(self.value, self.ctxt)
 
 
 class Op:
@@ -46,6 +57,7 @@ class Op:
             if var.value is None:
                 return
         self.exec_fn(evaluator, ctxt)
+        evaluator.vars.add(self.out)
 
     def exec_fn(self, evaluator, ctxt):
         self.fn(evaluator, ctxt, self.out, *self.vars)
@@ -58,29 +70,79 @@ class Ex(Op):
         self.out.set(self.fn(*vals), evaluator, ctxt)
 
 
+class Call:
+
+    def __init__(self, vars, out):
+        self.vars = vars
+        self.out = out
+
+    def exec_fn(self, evaluator, ctxt):
+        group = self.vars[0].dup()
+        args = Group()
+        for i, var in enumerate(self.vars[1:]):
+            args.index(i).unify(var)
+            group.value.name('args').unify(args)
+        group.value.name('result').unify(self.out)
+
+
 class Group:
 
-    def __init__(self, ops, vars):
+    def __init__(self, ops=None, vars=None, groups=None):
+        if ops is None:
+            ops = []
+        if vars is None:
+            vars = []
+        if groups is None:
+            groups = []
         self.ops = ops
         self.vars = vars
+        self.groups = groups
+        self.by_name = {}
+        self.by_index = {}
 
-    def dup(self, ctxt, inputs=()):
-        op_map = {}
-        var_map = {}
+    def name(self, name, var=None):
+        if var is None:
+            return self.by_name[name]
+        else:
+            assert var in self.vars
+            assert name not in self.by_name
+            self.by_name[name] = var
+
+    def index(self, index, var=None):
+        if var is None:
+            return self.by_index[index]
+        else:
+            assert var in self.vars
+            assert index not in self.by_index
+            self.by_index[index] = var
+
+    def unify(self, other_group):
+        for name, var in self.by_name.items():
+            var.unify(other_group.name(name))
+        for index, var in self.by_index.items():
+            var.unify(other_group.index(index))
+
+    def dup(self, memo=None):
+        '''Perform of the group. This is deep in the sense that it copies all
+        of the variables, operators, and groups in this group. The groups are
+        also dup'd recursively. However, variables and operators outside of
+        this family of groups are not copied.
+        '''
+        if memo is None:
+            memo = {}
+        if self in memo:
+            return memo[self]
         for var in self.vars:
-            var_map[var] = Var(var.value)
+            memo[var] = Var(var.value)
+        for group in self.groups:
+            memo[group] = group.dup(memo)
         for op in self.ops:
-            op_map[op] = Op([var_map.get(v, v) for v in op.vars], op.fn,
-                            var_map.get(op.out, op.out))
-        outputs = []
-        for i in inputs:
-            if i in var_map:
-                outputs.append(var_map[i])
-            elif i in op_map:
-                outputs.append(op_map[i])
-            else:
-                raise AssertionError('dup target {!r} not in group'.format(i))
-        return Group(list(op_map.values()), list(var_map.values())), outputs
+            memo[op] = Op([memo.get(v, v) for v in op.vars], op.fn,
+                          memo.get(op.out, op.out))
+        ops = [memo[op] for op in self.ops]
+        vars = [memo[var] for var in self.vars]
+        groups = [memo[group] for group in self.groups]
+        return Group(ops, vars, groups)
 
 
 def conflict_helper(evaluator, ctxt, out, op, a, b):
@@ -101,6 +163,7 @@ class Evaluator:
     def run(self):
         while len(self.vars) > 0:
             var = self.vars.pop()
+            print('var', var)
             for op in var.ops:
                 op.run(self, var.ctxt)
 
@@ -143,3 +206,30 @@ Ex([anon1], identity, y)
 Ex([x], print, Var())
 
 Evaluator([anon1]).run()
+
+a = Var()
+b = Var()
+one = Var(1)
+two = Var(2)
+Ex([b, one], operator.add, a)
+Ex([b, two], operator.add, a)
+Ex([a], print, Var())
+v = Var()
+i = Var()
+j = Var()
+conflict_op = Ex([i, j], min, v)
+args = Group(vars=[v, i, j])
+args.index(0, v)
+args.index(1, i)
+args.index(2, j)
+args_var = Var(args)
+result_var = Var()
+conflict_fn = Group(vars=[args_var, result_var, v, i, j], ops=[conflict_op],
+                    groups=[args])
+conflict_fn.name('args', args_var)
+conflict_fn.name('result', result_var)
+ctxt = Context()
+ctxt.conflict.unify(conflict_fn)
+conflict_one = Var(1, ctxt)
+Ex([conflict_one], identity, b)
+Evaluator([one, two, conflict_one, a, b]).run()
